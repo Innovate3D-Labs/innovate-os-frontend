@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 	"log"
 	"github.com/gorilla/websocket"
@@ -294,4 +295,114 @@ func (c *BackendClient) GetSystemLogs() ([]string, error) {
 	}
 	
 	return logs, nil
+} 
+
+// makeRequest is a helper to make authenticated requests (add if not exists)
+func (c *BackendClient) makeRequest(method, path string, data interface{}) (*http.Response, error) {
+	url := fmt.Sprintf("http://%s%s", c.baseURL, path)
+	
+	var body io.Reader
+	if data != nil {
+		jsonData, err := json.Marshal(data)
+		if err != nil {
+			return nil, err
+		}
+		body = strings.NewReader(string(jsonData))
+	}
+	
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	
+	req.Header.Set("Content-Type", "application/json")
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
+	
+	return c.httpClient.Do(req)
+}
+
+// StartPrinterDiscovery starts the printer discovery process
+func (c *BackendClient) StartPrinterDiscovery() error {
+	resp, err := c.makeRequest("POST", "/api/serial/discover", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("failed to start discovery: %s", resp.Status)
+	}
+	
+	return nil
+}
+
+// DiscoveryStatus represents the discovery status response
+type DiscoveryStatus struct {
+	IsScanning bool                `json:"is_scanning"`
+	Discovered []DiscoveredPrinter `json:"discovered"`
+	Count      int                 `json:"count"`
+}
+
+// DiscoveredPrinter represents a discovered printer from the backend
+type DiscoveredPrinter struct {
+	Port         string                 `json:"port"`
+	Name         string                 `json:"name"`
+	Firmware     string                 `json:"firmware"`
+	MachineType  string                 `json:"machine_type"`
+	BaudRate     int                    `json:"baud_rate"`
+	IsCompatible bool                   `json:"is_compatible"`
+	DiscoveredAt time.Time              `json:"discovered_at"`
+	Identity     *PrinterIdentity       `json:"identity"`
+	Manufacturer map[string]string      `json:"manufacturer,omitempty"`
+}
+
+// PrinterIdentity represents the unique identity of a printer
+type PrinterIdentity struct {
+	ID           string `json:"id"`
+	SerialNumber string `json:"serial_number"`
+	UUID         string `json:"uuid"`
+	Fingerprint  string `json:"fingerprint"`
+}
+
+// GetDiscoveryStatus gets the current discovery status
+func (c *BackendClient) GetDiscoveryStatus() (*DiscoveryStatus, error) {
+	resp, err := c.makeRequest("GET", "/api/serial/discovery/status", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	var result struct {
+		Data DiscoveryStatus `json:"data"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	
+	return &result.Data, nil
+}
+
+// ConnectPrinter connects to a discovered printer
+func (c *BackendClient) ConnectPrinter(printer DiscoveredPrinter) error {
+	data := map[string]interface{}{
+		"port":         printer.Port,
+		"baud_rate":    printer.BaudRate,
+		"identity":     printer.Identity,
+		"manufacturer": printer.Manufacturer,
+	}
+	
+	resp, err := c.makeRequest("POST", "/api/serial/connect", data)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("failed to connect: %s", resp.Status)
+	}
+	
+	return nil
 } 

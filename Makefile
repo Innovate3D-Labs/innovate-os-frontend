@@ -143,6 +143,16 @@ EOF
 	@chmod +x $(BUILD_DIR)/deploy/install.sh
 	@echo "Deployment package created in $(BUILD_DIR)/deploy/"
 
+# Build discovery demo
+build-discovery-demo:
+	@echo "$(GREEN)Building printer discovery demo...$(NC)"
+	go build -o bin/discovery-demo discovery_demo.go printer_discovery.go backend_client.go theme.go
+
+# Run discovery demo
+run-discovery-demo: build-discovery-demo
+	@echo "$(GREEN)Running printer discovery demo...$(NC)"
+	./bin/discovery-demo
+
 # Help
 help:
 	@echo "Available targets:"

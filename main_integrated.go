@@ -451,6 +451,21 @@ func (app *IntegratedApp) showIntegratedSettings() {
 	printerName := widget.NewEntry()
 	printerName.SetText("Innovate 3D Printer")
 	
+	// Printer Discovery Button
+	btnDiscoverPrinters := widget.NewButtonWithIcon("Discover Printers", theme.SearchIcon(), func() {
+		discoveryUI := NewPrinterDiscoveryUI(app.app, app.backend)
+		discoveryUI.SetOnConnect(func(printer DiscoveredPrinter) {
+			// Update printer name from discovery
+			if printer.Name != "" {
+				printerName.SetText(printer.Name)
+			}
+			// Refresh status after connection
+			app.refreshStatus()
+		})
+		discoveryUI.Show()
+	})
+	btnDiscoverPrinters.Importance = widget.HighImportance
+	
 	bedTempSlider := widget.NewSlider(0, 100)
 	bedTempSlider.SetValue(60)
 	bedTempSlider.Step = 5
@@ -469,9 +484,16 @@ func (app *IntegratedApp) showIntegratedSettings() {
 		hotendTempLabel.SetText(fmt.Sprintf("%.0f°C", value))
 	}
 	
-	settingsForm := container.NewVBox(
+	// Printer connection info card
+	connectionInfo := widget.NewCard("Printer Connection", "", container.NewVBox(
 		widget.NewLabel("Printer Name:"),
 		printerName,
+		btnDiscoverPrinters,
+		widget.NewSeparator(),
+	))
+	
+	// Temperature settings card
+	temperatureSettings := widget.NewCard("Default Temperatures", "", container.NewVBox(
 		widget.NewLabel("Default Bed Temperature:"),
 		container.NewHBox(bedTempSlider, bedTempLabel),
 		widget.NewLabel("Default Hotend Temperature:"),
@@ -489,10 +511,11 @@ func (app *IntegratedApp) showIntegratedSettings() {
 				app.showInfo("Settings Applied", "Temperature settings applied successfully")
 			}
 		}),
-	)
+	))
 	
 	app.mainView = container.NewVBox(
-		widget.NewCard("Settings", "", settingsForm),
+		connectionInfo,
+		temperatureSettings,
 	)
 	
 	app.updateMainContent()

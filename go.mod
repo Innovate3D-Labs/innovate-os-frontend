@@ -3,8 +3,10 @@ module innovate-os-frontend
 go 1.21
 
 require (
-    fyne.io/fyne/v2 v2.4.0
-    github.com/gorilla/websocket v1.5.0
+	fyne.io/fyne/v2 v2.4.2
+	github.com/gorilla/websocket v1.5.1
+	github.com/golang-jwt/jwt/v5 v5.2.0
+	go.bug.st/serial v1.6.1
 )
 
 require (

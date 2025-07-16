@@ -26,9 +26,24 @@ type IntegratedApp struct {
 	sidebar       *container.VBox
 	mainView      *container.VBox
 	
+	// Authentication
+	authManager   *AuthManager
+	loginUI       *LoginUI
+	profileUI     *UserProfileUI
+	tokenHandler  *TokenExpiredHandler
+	
 	// Backend integration
 	backend       *BackendClient
 	statusChan    chan PrinterStatus
+	
+	// Connection status
+	connectionStatus *fyne.Container
+	
+	// Temperature monitoring
+	temperatureUI *TemperatureUI
+	
+	// G-code viewer
+	gcodeViewerUI *GCodeViewerUI
 	
 	// UI Components for real-time updates
 	tempLabel     *widget.Label
@@ -42,6 +57,7 @@ type IntegratedApp struct {
 	currentStatus PrinterStatus
 	printJobs     []PrintJob
 	selectedFile  string
+	isAuthenticated bool
 }
 
 func NewIntegratedApp() *IntegratedApp {
@@ -52,24 +68,92 @@ func NewIntegratedApp() *IntegratedApp {
 	w.Resize(fyne.NewSize(1024, 600))
 	w.SetFullScreen(true)
 	
+	// Initialize authentication
+	authManager := NewAuthManager("localhost:8080")
+	
 	// Initialize backend client
 	backend := NewBackendClient("localhost:8080")
 	
-	return &IntegratedApp{
+	app := &IntegratedApp{
 		app:        a,
 		window:     w,
+		authManager: authManager,
 		backend:    backend,
 		statusChan: make(chan PrinterStatus, 100),
+		isAuthenticated: authManager.IsAuthenticated(),
 	}
+	
+	// Create auth UI components
+	app.loginUI = NewLoginUI(w, authManager)
+	app.loginUI.SetLoginSuccessCallback(func() {
+		app.isAuthenticated = true
+		app.updateAuthToken()
+		app.setupUI()
+		app.initializeBackend()
+	})
+	
+	app.profileUI = NewUserProfileUI(w, authManager)
+	app.profileUI.SetLogoutCallback(func() {
+		app.isAuthenticated = false
+		app.backend.CloseWebSocket()
+		app.showLoginScreen()
+	})
+	
+	app.tokenHandler = NewTokenExpiredHandler(w, authManager)
+	app.tokenHandler.onReauth = func() {
+		app.showLoginScreen()
+	}
+	
+	// Set auth change callback
+	authManager.SetAuthChangeCallback(func(authenticated bool) {
+		app.isAuthenticated = authenticated
+		if authenticated {
+			app.updateAuthToken()
+		}
+	})
+	
+	return app
+}
+
+func (app *IntegratedApp) updateAuthToken() {
+	// Update backend client with new token
+	token := app.authManager.GetToken()
+	app.backend.SetAuthToken(token)
+}
+
+func (app *IntegratedApp) showLoginScreen() {
+	app.window.SetContent(app.loginUI.GetContent())
 }
 
 func (app *IntegratedApp) initializeBackend() {
+	// Only initialize if authenticated
+	if !app.isAuthenticated {
+		return
+	}
+	
+	// Update log
+	if app.logEntry != nil {
+		app.logEntry.SetText(app.logEntry.Text + "\nConnecting to backend WebSocket...")
+	}
+	
 	// Connect to WebSocket for real-time updates
 	err := app.backend.ConnectWebSocket()
 	if err != nil {
 		log.Printf("Failed to connect to WebSocket: %v", err)
-		app.showError("Backend Connection Error", fmt.Sprintf("Failed to connect to printer backend:\n%v", err))
+		// Check if it's an auth error
+		if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "unauthorized") {
+			app.tokenHandler.HandleTokenExpired()
+			return
+		}
+		if app.logEntry != nil {
+			app.logEntry.SetText(app.logEntry.Text + fmt.Sprintf("\nWebSocket connection failed: %v", err))
+		}
+		// Don't show error dialog - the connection manager will handle reconnection
 		return
+	}
+	
+	if app.logEntry != nil {
+		app.logEntry.SetText(app.logEntry.Text + "\nWebSocket connected successfully!")
 	}
 	
 	// Start listening for updates
@@ -86,13 +170,27 @@ func (app *IntegratedApp) handleStatusUpdates() {
 	for status := range app.statusChan {
 		app.currentStatus = status
 		app.updateUI()
+		
+		// Update temperature chart if available
+		if app.temperatureUI != nil {
+			// Temperature data is automatically updated via the TemperatureUI's own ticker
+			// But we can also manually sync here if needed
+		}
+		
+		// Sync G-code viewer with print progress if available
+		if app.gcodeViewerUI != nil && status.CurrentLayer > 0 {
+			// Estimate current line based on layer progress
+			// This is a simplified approach - real implementation would need actual line tracking
+			app.gcodeViewerUI.SyncWithPrintProgress(int(status.Progress * 1000))
+		}
 	}
 }
 
 func (app *IntegratedApp) updateUI() {
 	if app.tempLabel != nil {
-		app.tempLabel.SetText(fmt.Sprintf("Hotend: %.1f°C | Bed: %.1f°C", 
-			app.currentStatus.Temperature, app.currentStatus.BedTemp))
+		tempData := fmt.Sprintf("Hotend: %.1f°C | Bed: %.1f°C", 
+			app.currentStatus.Temperature, app.currentStatus.BedTemp)
+		app.tempLabel.SetText(tempData)
 	}
 	
 	if app.progressBar != nil {
@@ -110,7 +208,29 @@ func (app *IntegratedApp) updateUI() {
 	}
 	
 	if app.statusLabel != nil {
-		app.statusLabel.SetText(fmt.Sprintf("Status: %s", app.currentStatus.Status))
+		app.statusLabel.SetText(app.currentStatus.Status)
+	}
+	
+	// Update log with important events
+	if app.logEntry != nil {
+		currentText := app.logEntry.Text
+		
+		// Add significant temperature changes
+		if app.currentStatus.Temperature > 0 {
+			lastLine := ""
+			lines := strings.Split(currentText, "\n")
+			if len(lines) > 0 {
+				lastLine = lines[len(lines)-1]
+			}
+			
+			// Only log if temperature changed significantly or status changed
+			if !strings.Contains(lastLine, fmt.Sprintf("%.0f°C", app.currentStatus.Temperature)) {
+				timestamp := time.Now().Format("15:04:05")
+				logEntry := fmt.Sprintf("\n[%s] Temp: Hotend %.1f°C, Bed %.1f°C - %s", 
+					timestamp, app.currentStatus.Temperature, app.currentStatus.BedTemp, app.currentStatus.Status)
+				app.logEntry.SetText(currentText + logEntry)
+			}
+		}
 	}
 }
 
@@ -131,7 +251,6 @@ func (app *IntegratedApp) refreshPrintJobs() {
 		log.Printf("Failed to get print jobs: %v", err)
 		return
 	}
-	
 	app.printJobs = jobs
 }
 
@@ -155,49 +274,94 @@ func (app *IntegratedApp) showInfo(title, message string) {
 	dialog.ShowInformation(title, message, app.window)
 }
 
-func (app *IntegratedApp) createIntegratedSidebar() *container.VBox {
-	// Navigation buttons
+func (app *IntegratedApp) createSidebar() *container.VBox {
+	// Add profile button at the top
+	profileButton := widget.NewButton("Profile", func() {
+		app.showProfile()
+	})
+	profileButton.Resize(fyne.NewSize(200, 60))
+	
+	// Show user info if authenticated
+	var userInfo fyne.CanvasObject
+	if user := app.authManager.GetUser(); user != nil {
+		userLabel := widget.NewLabel(fmt.Sprintf("👤 %s", user.Username))
+		userLabel.Alignment = fyne.TextAlignCenter
+		userInfo = userLabel
+	} else {
+		userInfo = widget.NewLabel("Not logged in")
+	}
+	
+	// Create compact connection status indicator
+	app.connectionStatus = CreateCompactStatusIndicator(app.backend)
+	
+	// Create navigation buttons with touch-optimized sizing
 	btnDashboard := widget.NewButton("Dashboard", func() {
-		app.showIntegratedDashboard()
+		app.showDashboard()
 	})
 	btnDashboard.Resize(fyne.NewSize(200, 60))
 	btnDashboard.Importance = widget.HighImportance
 	
 	btnPrint := widget.NewButton("Print Control", func() {
-		app.showIntegratedPrintControl()
+		app.showPrintControl()
 	})
 	btnPrint.Resize(fyne.NewSize(200, 60))
 	
+	btnTemperature := widget.NewButton("Temperature", func() {
+		app.showTemperature()
+	})
+	btnTemperature.Resize(fyne.NewSize(200, 60))
+	
+	btnGCodeViewer := widget.NewButton("G-Code Viewer", func() {
+		app.showGCodeViewer()
+	})
+	btnGCodeViewer.Resize(fyne.NewSize(200, 60))
+	
 	btnFiles := widget.NewButton("Files", func() {
-		app.showIntegratedFiles()
+		app.showFiles()
 	})
 	btnFiles.Resize(fyne.NewSize(200, 60))
 	
 	btnSettings := widget.NewButton("Settings", func() {
-		app.showIntegratedSettings()
+		app.showSettings()
 	})
 	btnSettings.Resize(fyne.NewSize(200, 60))
 	
+	// Printer discovery button
+	btnPrinterDiscovery := widget.NewButton("Printer Discovery", func() {
+		app.showPrinterDiscovery()
+	})
+	btnPrinterDiscovery.Resize(fyne.NewSize(200, 60))
+	
+	// Print jobs button  
+	btnPrintJobs := widget.NewButton("Print Jobs", func() {
+		app.showPrintJobs()
+	})
+	btnPrintJobs.Resize(fyne.NewSize(200, 60))
+	
 	// Emergency stop button
 	btnEmergencyStop := widget.NewButton("EMERGENCY STOP", func() {
-		app.handleEmergencyStop()
+		app.emergencyStop()
 	})
 	btnEmergencyStop.Resize(fyne.NewSize(200, 80))
 	btnEmergencyStop.Importance = widget.DangerImportance
 	
-	// Connection status
-	connectionStatus := widget.NewLabel("Connected to Backend")
-	if !app.currentStatus.IsConnected {
-		connectionStatus.SetText("Disconnected")
-	}
-	
+	// Create sidebar with proper spacing
 	sidebar := container.NewVBox(
-		widget.NewCard("", "", canvas.NewText("Innovate OS", color.NRGBA{R: 28, G: 28, B: 30, A: 255})),
-		connectionStatus,
+		widget.NewCard("", "", container.NewVBox(
+			canvas.NewText("Innovate OS", color.NRGBA{R: 28, G: 28, B: 30, A: 255}),
+			userInfo,
+			profileButton,
+			widget.NewSeparator(),
+			app.connectionStatus,
+		)),
 		widget.NewSeparator(),
 		btnDashboard,
 		btnPrint,
+		btnTemperature,
+		btnGCodeViewer,
 		btnFiles,
+		btnPrintJobs,
+		btnPrinterDiscovery,
 		btnSettings,
 		layout.NewSpacer(),
 		btnEmergencyStop,
@@ -206,52 +370,93 @@ func (app *IntegratedApp) createIntegratedSidebar() *container.VBox {
 	return sidebar
 }
 
-func (app *IntegratedApp) showIntegratedDashboard() {
-	// Real-time temperature card
-	app.tempLabel = widget.NewLabel(fmt.Sprintf("Hotend: %.1f°C | Bed: %.1f°C", 
-		app.currentStatus.Temperature, app.currentStatus.BedTemp))
-	tempCard := widget.NewCard("Temperature", "", app.tempLabel)
+func (app *IntegratedApp) showProfile() {
+	app.profileUI.Refresh()
+	app.mainView = container.NewVBox(
+		widget.NewCard("User Profile", "", app.profileUI.GetContent()),
+	)
+	app.updateMainContent()
+}
+
+func (app *IntegratedApp) showDashboard() {
+	// Create connection status card
+	connectionCard := NewConnectionStatusCard(app.backend)
 	
-	// Real-time progress card
-	app.progressBar = widget.NewProgressBar()
-	app.progressBar.SetValue(app.currentStatus.Progress)
+	// Real-time temperature card with mini chart
+	tempData := ""
+	if app.temperatureUI != nil && app.temperatureUI.GetChart() != nil {
+		current := app.temperatureUI.GetChart().GetCurrentTemperatures()
+		if current != nil {
+			tempData = fmt.Sprintf("Hotend: %.1f°C | Bed: %.1f°C", 
+				current.HotendActual, current.BedActual)
+		}
+	}
+	if tempData == "" {
+		tempData = fmt.Sprintf("Hotend: %.1f°C | Bed: %.1f°C", 
+			app.currentStatus.Temperature, app.currentStatus.BedTemp)
+	}
+	
+	app.tempLabel = widget.NewLabel(tempData)
+	tempProgressBar := widget.NewProgressBar()
+	tempProgressBar.SetValue(app.currentStatus.Temperature / 250.0) // Scale to 250°C max
+	
+	tempCard := widget.NewCard("Temperature", "", 
+		container.NewVBox(
+			app.tempLabel, 
+			tempProgressBar,
+			widget.NewButton("View Chart", func() {
+				app.showTemperature()
+			}),
+		))
+	
+	// Progress card
 	app.progressLabel = widget.NewLabel(fmt.Sprintf("Layer %d/%d", 
 		app.currentStatus.CurrentLayer, app.currentStatus.TotalLayers))
+	app.progressBar = widget.NewProgressBar()
+	app.progressBar.SetValue(app.currentStatus.Progress)
 	progressCard := widget.NewCard("Print Progress", "", 
-		container.NewVBox(app.progressBar, app.progressLabel))
+		container.NewVBox(app.progressLabel, app.progressBar))
 	
-	// Real-time position card
+	// Position card
 	app.positionLabel = widget.NewLabel(fmt.Sprintf("X: %.1f | Y: %.1f | Z: %.1f", 
 		app.currentStatus.PositionX, app.currentStatus.PositionY, app.currentStatus.PositionZ))
-	app.statusLabel = widget.NewLabel(fmt.Sprintf("Status: %s", app.currentStatus.Status))
-	positionCard := widget.NewCard("Position & Status", "", 
+	app.statusLabel = widget.NewLabel(app.currentStatus.Status)
+	positionCard := widget.NewCard("Position", "", 
 		container.NewVBox(app.positionLabel, app.statusLabel))
 	
+	// Create dashboard layout with connection status at the top
 	topRow := container.NewGridWithColumns(3, tempCard, progressCard, positionCard)
 	
-	// Real-time system log
+	// Real-time log
 	app.logEntry = widget.NewEntry()
 	app.logEntry.MultiLine = true
-	app.refreshLogs()
-	
-	logCard := widget.NewCard("System Log", "", app.logEntry)
-	
-	// Add refresh button
-	refreshBtn := widget.NewButton("Refresh", func() {
-		app.refreshStatus()
-		app.refreshLogs()
-	})
+	app.logEntry.SetText("System initialized...\nWaiting for printer connection...")
+	logCard := widget.NewCard("System Log", "", 
+		container.NewMax(app.logEntry))
 	
 	app.mainView = container.NewVBox(
+		connectionCard.GetCard(),
 		topRow,
-		refreshBtn,
 		logCard,
 	)
 	
 	app.updateMainContent()
 }
 
-func (app *IntegratedApp) showIntegratedPrintControl() {
+func (app *IntegratedApp) showTemperature() {
+	// Initialize temperature UI if not already done
+	if app.temperatureUI == nil {
+		app.temperatureUI = NewTemperatureUI(app.window, app.backend)
+	}
+	
+	app.mainView = container.NewVBox(
+		app.temperatureUI.GetContent(),
+	)
+	
+	app.updateMainContent()
+}
+
+func (app *IntegratedApp) showPrintControl() {
 	// Print control buttons with backend integration
 	btnStart := widget.NewButton("Start Print", func() {
 		if app.selectedFile == "" {
@@ -342,7 +547,7 @@ func (app *IntegratedApp) showIntegratedPrintControl() {
 	app.updateMainContent()
 }
 
-func (app *IntegratedApp) showIntegratedFiles() {
+func (app *IntegratedApp) showFiles() {
 	// Refresh print jobs from backend
 	app.refreshPrintJobs()
 	
@@ -446,7 +651,7 @@ func (app *IntegratedApp) showIntegratedFiles() {
 	app.updateMainContent()
 }
 
-func (app *IntegratedApp) showIntegratedSettings() {
+func (app *IntegratedApp) showSettings() {
 	// Settings with backend integration
 	printerName := widget.NewEntry()
 	printerName.SetText("Innovate 3D Printer")
@@ -521,7 +726,115 @@ func (app *IntegratedApp) showIntegratedSettings() {
 	app.updateMainContent()
 }
 
-func (app *IntegratedApp) handleEmergencyStop() {
+func (app *IntegratedApp) showPrinterDiscovery() {
+	discoveryUI := NewPrinterDiscoveryUI(app.app, app.backend)
+	discoveryUI.SetOnConnect(func(printer DiscoveredPrinter) {
+		// Refresh status after connection
+		app.refreshStatus()
+	})
+	discoveryUI.Show()
+}
+
+func (app *IntegratedApp) showPrintJobs() {
+	// Refresh print jobs from backend
+	app.refreshPrintJobs()
+	
+	// Print jobs list with real data
+	jobList := widget.NewList(
+		func() int { return len(app.printJobs) },
+		func() fyne.CanvasObject {
+			return container.NewHBox(
+				widget.NewLabel("Filename"),
+				layout.NewSpacer(),
+				widget.NewLabel("Status"),
+			)
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			if id < len(app.printJobs) {
+				job := app.printJobs[id]
+				container := obj.(*container.Container)
+				nameLabel := container.Objects[0].(*widget.Label)
+				statusLabel := container.Objects[2].(*widget.Label)
+				
+				nameLabel.SetText(job.Filename)
+				statusLabel.SetText(job.Status)
+			}
+		},
+	)
+	
+	// Job selection
+	jobList.OnSelected = func(id widget.ListItemID) {
+		if id < len(app.printJobs) {
+			job := app.printJobs[id]
+			dialog.ShowInformation("Job Details", 
+				fmt.Sprintf("Filename: %s\nStatus: %s\nProgress: %.1f%%\nLayer: %d/%d\nPosition: X=%.1f, Y=%.1f, Z=%.1f",
+					job.Filename, job.Status, job.Progress*100, job.CurrentLayer, job.TotalLayers, job.PositionX, job.PositionY, job.PositionZ),
+				app.window)
+		}
+	}
+	
+	// Job management buttons
+	btnCancel := widget.NewButton("Cancel Job", func() {
+		if app.selectedFile == "" {
+			app.showError("No File Selected", "Please select a file to cancel")
+			return
+		}
+		
+		dialog.ShowConfirm("Cancel Job", 
+			fmt.Sprintf("Are you sure you want to cancel the print job for %s?", app.selectedFile),
+			func(confirmed bool) {
+				if confirmed {
+					err := app.backend.CancelPrintJob(app.selectedFile)
+					if err != nil {
+						app.showError("Cancel Error", fmt.Sprintf("Failed to cancel job: %v", err))
+					} else {
+						app.showInfo("Job Cancelled", fmt.Sprintf("Print job for %s cancelled", app.selectedFile))
+						app.selectedFile = ""
+						app.refreshPrintJobs()
+					}
+				}
+			}, app.window)
+	})
+	btnCancel.Resize(fyne.NewSize(180, 80))
+	btnCancel.Importance = widget.DangerImportance
+	
+	btnDelete := widget.NewButton("Delete Job", func() {
+		if app.selectedFile == "" {
+			app.showError("No File Selected", "Please select a file to delete")
+			return
+		}
+		
+		dialog.ShowConfirm("Delete Job", 
+			fmt.Sprintf("Are you sure you want to delete the print job for %s?", app.selectedFile),
+			func(confirmed bool) {
+				if confirmed {
+					err := app.backend.DeletePrintJob(app.selectedFile)
+					if err != nil {
+						app.showError("Delete Error", fmt.Sprintf("Failed to delete job: %v", err))
+					} else {
+						app.showInfo("Job Deleted", fmt.Sprintf("Print job for %s deleted", app.selectedFile))
+						app.selectedFile = ""
+						app.refreshPrintJobs()
+					}
+				}
+			}, app.window)
+	})
+	btnDelete.Resize(fyne.NewSize(180, 80))
+	btnDelete.Importance = widget.DangerImportance
+	
+	buttonRow := container.NewHBox(btnCancel, btnDelete)
+	
+	app.mainView = container.NewVBox(
+		widget.NewCard("Print Jobs", "", container.NewVBox(
+			buttonRow,
+			jobList,
+		)),
+	)
+	
+	app.updateMainContent()
+}
+
+func (app *IntegratedApp) emergencyStop() {
 	dialog.ShowConfirm("Emergency Stop", 
 		"Are you sure you want to perform an emergency stop?",
 		func(confirmed bool) {
@@ -536,28 +849,56 @@ func (app *IntegratedApp) handleEmergencyStop() {
 		}, app.window)
 }
 
+func (app *IntegratedApp) showGCodeViewer() {
+	// Initialize G-code viewer UI if not already done
+	if app.gcodeViewerUI == nil {
+		app.gcodeViewerUI = NewGCodeViewerUI(app.window, app.backend)
+	}
+	
+	app.mainView = container.NewVBox(
+		app.gcodeViewerUI.GetContent(),
+	)
+	
+	app.updateMainContent()
+}
+
 func (app *IntegratedApp) updateMainContent() {
 	app.content.Objects[1] = container.NewScroll(app.mainView)
 	app.content.Refresh()
 }
 
 func (app *IntegratedApp) setupUI() {
-	app.sidebar = app.createIntegratedSidebar()
-	app.showIntegratedDashboard()
+	app.sidebar = app.createSidebar()
+	app.showDashboard() // Show dashboard by default
 	
+	// Create main layout with sidebar
 	app.content = container.NewBorder(
-		nil, nil,
-		app.sidebar, nil,
-		container.NewScroll(app.mainView),
+		nil, nil, // top, bottom
+		app.sidebar, nil, // left, right
+		container.NewScroll(app.mainView), // center
 	)
 	
 	app.window.SetContent(app.content)
 }
 
 func (app *IntegratedApp) run() {
-	app.setupUI()
-	app.initializeBackend()
+	// Check if already authenticated
+	if app.isAuthenticated {
+		app.setupUI()
+		app.initializeBackend()
+	} else {
+		app.showLoginScreen()
+	}
+	
 	app.window.ShowAndRun()
+	
+	// Cleanup on exit
+	if app.temperatureUI != nil {
+		app.temperatureUI.Stop()
+	}
+	if app.gcodeViewerUI != nil {
+		app.gcodeViewerUI.Stop()
+	}
 }
 
 // Alternative main function for integrated version
